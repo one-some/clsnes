@@ -41,6 +41,72 @@ struct Registers {
 
 } registers;
 
+struct Memory {
+    uint8_t WRAM[0xFFFF * 2];
+
+    union {
+        struct {
+            uint8_t JOYPAD_ENABLE : 1;
+            uint8_t _UNUSED_0 : 3;
+            uint8_t H_V_IRQ : 1;
+            uint8_t _UNUSED_1 : 1;
+            uint8_t VBLANK_NMI_ENABLE : 1;
+        } flags;
+        uint8_t byte;
+    } NMITIMEN;
+
+    union {
+        struct {
+            uint8_t CHANNEL_0 : 1;
+            uint8_t CHANNEL_1 : 1;
+            uint8_t CHANNEL_2 : 1;
+            uint8_t CHANNEL_3 : 1;
+            uint8_t CHANNEL_4 : 1;
+            uint8_t CHANNEL_5 : 1;
+            uint8_t CHANNEL_6 : 1;
+            uint8_t CHANNEL_7 : 1;
+        } flags;
+        uint8_t byte;
+    } MDMAEN_GENERAL_PURPOSE;
+
+    union {
+        struct {
+            uint8_t CHANNEL_0 : 1;
+            uint8_t CHANNEL_1 : 1;
+            uint8_t CHANNEL_2 : 1;
+            uint8_t CHANNEL_3 : 1;
+            uint8_t CHANNEL_4 : 1;
+            uint8_t CHANNEL_5 : 1;
+            uint8_t CHANNEL_6 : 1;
+            uint8_t CHANNEL_7 : 1;
+        } flags;
+        uint8_t byte;
+    } MDMAEN_HBLANK_DMA;
+
+    uint8_t APUI00;
+    uint8_t APUI01;
+    uint8_t APUI02;
+    uint8_t APUI03;
+
+    union {
+        struct {
+            uint8_t MASTER_BRIGHTNESS : 3;
+            uint8_t _UNUSED : 2;
+            uint8_t FORCED_BLANKING : 1;
+        } flags;
+        uint8_t byte;
+    } INIDISP;
+
+    union {
+        struct {
+            uint8_t OBJ_SIZE : 3;
+            uint8_t OBJ_GAP : 1;
+            uint8_t TILE_BASE : 2;
+        } flags;
+        uint8_t byte;
+    } OBSEL;
+} memory;
+
 void load_rom(const char* path) {
     FILE* fp = fopen(path, "rb");
     ASSERT(fp, "Couldn't load ROM");
@@ -124,14 +190,70 @@ void locate_header() {
     printf("Hello '%s'\n", game_name);
 }
 
-uint8_t read_mem(uint32_t address) {
-    uint8_t bank = address >> 16;
-    uint16_t offset = address & 0xFFFF;
+bool is_acc_16() {
+    return (!registers.status.flags.M) && (!registers.E_flag);
+}
+
+bool is_index_16() {
+    return (!registers.status.flags.X) && (!registers.E_flag);
+}
+
+
+void handle_io_write(uint16_t addr, uint8_t value) {
+    switch (addr) {
+        case 0x2100: memory.INIDISP.byte = value; break;
+        case 0x2101: memory.OBSEL.byte = value; break;
+        case 0x2140:
+             memory.APUI00 = value;
+             printf("WROTE %x\n", value);
+             break;
+        case 0x2141: memory.APUI01 = value; break;
+        case 0x2142: memory.APUI02 = value; break;
+        case 0x2143: memory.APUI03 = value; break;
+        case 0x4200: memory.NMITIMEN.byte = value; break;
+        case 0x420B: memory.MDMAEN_GENERAL_PURPOSE.byte = value; break;
+        case 0x420C: memory.MDMAEN_HBLANK_DMA.byte = value; break;
+        default:
+            ASSERT_NOT_REACHED("Unsure how to handle write to I/O register %x (val %x)", addr, value);
+    }
+}
+
+uint8_t handle_io_read(uint16_t addr) {
+    if (is_acc_16()) {
+        switch (addr) {
+            case 0x2140: return (memory.APUI01 << 8) | memory.APUI00;
+            case 0x2141: return (memory.APUI02 << 8) | memory.APUI01;
+            default:
+                ASSERT_NOT_REACHED("[ACC16] Unsure how to handle read from I/O register %x)", addr);
+        }
+    }
+
+    switch (addr) {
+        case 0x2140: return memory.APUI00;
+        case 0x2141: return memory.APUI01;
+        case 0x2142: return memory.APUI02;
+        case 0x2143: return memory.APUI03;
+        default:
+            ASSERT_NOT_REACHED("Unsure how to handle read from I/O register %x)", addr);
+    }
+}
+
+uint8_t read_mem(uint32_t loc) {
+    uint8_t bank = loc >> 16;
+    uint16_t addr = loc & 0xFFFF;
 
     if (rom_file.header_offset == LO_ROM_OFFSET) {
-        if (offset >= 0x8000) {
+        if (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)) {
+            if (addr < 0x2000) {
+                return memory.WRAM[addr];
+            } else if (addr < 0x6000) {
+                return handle_io_read(addr);
+            }
+        }
+
+        if (addr >= 0x8000) {
             // LoROM
-            uint32_t rom_read = offset - 0x8000 + (bank * 0x8000);
+            uint32_t rom_read = addr - 0x8000 + (bank * 0x8000);
             return *(rom_file.data + rom_read);
         }
     } else if (rom_file.header_offset == HI_ROM_OFFSET) {
@@ -142,7 +264,7 @@ uint8_t read_mem(uint32_t address) {
         ASSERT_NOT_REACHED("Bad header offset");
     }
 
-    ASSERT_NOT_REACHED("Unsure how to read %x", address);
+    ASSERT_NOT_REACHED("Unsure how to read %x", loc);
 }
 
 uint16_t read_u16(uint32_t addr) {
@@ -153,7 +275,29 @@ uint16_t read_u16(uint32_t addr) {
 }
 
 void write_u8(uint32_t loc, uint8_t value) {
-    // printf("Write %x to %x\n", loc, value);
+    ASSERT(rom_file.header_offset == LO_ROM_OFFSET, "Unsure how to write to HiROM");
+    uint8_t bank = loc >> 16;
+    uint16_t addr = loc & 0xFFFF;
+
+    if (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)) {
+        if (addr < 0x2000) {
+            memory.WRAM[addr] = value;
+            return;
+        } else if (addr < 0x6000) {
+            handle_io_write(addr, value);
+            return;
+        }
+    }
+
+    if (bank == 0x7E) {
+        memory.WRAM[addr] = value;
+        return;
+    } else if (bank == 0x7F) {
+        memory.WRAM[addr + 0x10000] = value;
+        return;
+    }
+
+    ASSERT_NOT_REACHED("Unimplemented write to %x", loc);
 }
 
 void write_u16(uint32_t loc, uint16_t value) {
@@ -182,14 +326,6 @@ uint32_t eat_u24() {
     uint8_t c = eat_u8();
 
     return 0x000000 | (c << 16) | (b << 8) | a;
-}
-
-bool is_acc_16() {
-    return (!registers.status.flags.M) && (!registers.E_flag);
-}
-
-bool is_index_16() {
-    return (!registers.status.flags.X) && (!registers.E_flag);
 }
 
 void eat_cycles(int count) {
@@ -249,6 +385,18 @@ void execute_opcode(uint8_t opcode) {
                 registers.PC += relative;
             }
             break;
+       } case 0xD0: {
+            bool take_branch = !registers.status.flags.Z;
+            eat_cycles(2);
+
+            int8_t relative = (int8_t)eat_u8();
+
+            if (registers.E_flag) eat_cycles(1);
+            if (take_branch) {
+                eat_cycles(1);
+                registers.PC += relative;
+            }
+            break;
        } case 0x20: {
             eat_cycles(6);
             uint32_t loc = addr_from_absolute(eat_u16());
@@ -293,6 +441,7 @@ void execute_opcode(uint8_t opcode) {
             uint16_t value = is_acc_16() ? read_u16(addr) : read_mem(addr);
             uint16_t a = registers.A & (is_acc_16() ? 0xFFFF : 0xFF);
             uint16_t out = a - value;
+            printf("CD with %x in A, have val%x \n", registers.A, value);
 
             registers.status.flags.N = auto_negative(out);
             registers.status.flags.Z = a == value;
@@ -469,6 +618,10 @@ void setup_cpu() {
     registers.status.flags.D = 0;
     registers.status.flags.I = 1;
     registers.E_flag = 1;
+
+    // Setup APU (mostly HAX)
+    memory.APUI00 = 0xAA;
+    memory.APUI01 = 0xBB;
 }
 
 int main() {
