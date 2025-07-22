@@ -64,7 +64,7 @@ void load_rom(const char* path) {
     fclose(fp);
 }
 
-uint16_t read_u16(uint8_t* source) {
+uint16_t read_u16_raw(uint8_t* source) {
     uint8_t a = *(source++);
     uint8_t b = *source;
 
@@ -90,7 +90,7 @@ int get_heuristic_score_for_header_candidate(size_t offset) {
         score -= 100;
     }
 
-    uint16_t reset_vector = read_u16((uint8_t*)(rom_file.data + offset + 0x3C));
+    uint16_t reset_vector = read_u16_raw((uint8_t*)(rom_file.data + offset + 0x3C));
 
     if (offset == LO_ROM_OFFSET) {
         if (reset_vector < 0x8000) score -= 10;
@@ -145,6 +145,13 @@ uint8_t read_mem(uint32_t address) {
     ASSERT_NOT_REACHED("Unsure how to read %x", address);
 }
 
+uint16_t read_u16(uint32_t addr) {
+    uint8_t a = read_mem(addr);
+    uint8_t b = read_mem(addr + 1);
+
+    return (b << 8) | a;
+}
+
 void write_u8(uint32_t loc, uint8_t value) {
     // printf("Write %x to %x\n", loc, value);
 }
@@ -181,26 +188,78 @@ bool is_acc_16() {
     return (!registers.status.flags.M) && (!registers.E_flag);
 }
 
+bool is_index_16() {
+    return (!registers.status.flags.X) && (!registers.E_flag);
+}
+
 void eat_cycles(int count) {
     // ...
 }
 
-void set_accumulator(uint16_t value) {
+void set_register(uint16_t* reg, uint16_t value) {
     if (is_acc_16()) {
-        registers.A = value;
-        registers.status.flags.N = !!(registers.A & 0b1000000000000000);
+        *(reg) = value;
+        registers.status.flags.N = !!(value >> 15);
         registers.status.flags.Z = value == 0;
     } else {
         uint8_t val_8 = value & 0xFF;
-        registers.A = (registers.A & 0xFF00) | val_8;
+        *(reg) = (*reg & 0xFF00) | val_8;
         registers.status.flags.N = !!(val_8 & 0b10000000);
         registers.status.flags.Z = val_8 == 0;
     }
 }
 
+uint32_t addr_from_absolute(uint16_t addr) {
+    return (registers.DBR << 16) | addr;
+}
+
+void set_low_byte(uint16_t* loc, uint8_t value) {
+    (*loc) = (*loc & 0xFF00) | (value & 0xFF);
+}
+
+void set_high_byte(uint16_t* loc, uint8_t value) {
+    (*loc) = (value << 16) | (*loc & 0xFF);
+}
+
+bool auto_negative(uint16_t value) {
+    int bits = is_acc_16() ? 15 : 7;
+    return !!(value & (0b1 << bits));
+}
+
+bool auto_zero(uint16_t value) {
+    if (!is_acc_16()) value = value & 0x00FF;
+    return value == 0;
+}
+
 void execute_opcode(uint8_t opcode) {
     switch (opcode) {
-        case 0x18: {
+       case 0x08: {
+            eat_cycles(3);
+            write_u8(--registers.S, registers.status.byte);
+            break;
+       } case 0x10: {
+            bool take_branch = !registers.status.flags.N;
+            eat_cycles(2);
+
+            int8_t relative = (int8_t)eat_u8();
+
+            if (registers.E_flag) eat_cycles(1);
+            if (take_branch) {
+                eat_cycles(1);
+                registers.PC += relative;
+            }
+            break;
+       } case 0x20: {
+            eat_cycles(6);
+            uint32_t loc = addr_from_absolute(eat_u16());
+            uint16_t return_addr = registers.PC - 1;
+
+            write_u8(registers.S--, return_addr >> 8);
+            write_u8(registers.S--, return_addr & 0xFF);
+
+            registers.PC = loc;
+            break;
+       } case 0x18: {
             eat_cycles(2);
             registers.status.flags.C = 0;
             break;
@@ -216,9 +275,73 @@ void execute_opcode(uint8_t opcode) {
             eat_cycles(2);
             registers.status.flags.D = 0;
             break;
+       } case 0x38: { // SEC
+            eat_cycles(2);
+            registers.status.flags.C = 1;
+            break;
        } case 0x78: { // SEI
             eat_cycles(2);
             registers.status.flags.I = 1;
+            break;
+       } case 0xF8: { // SED
+            eat_cycles(2);
+            registers.status.flags.D = 1;
+            break;
+       } case 0xCD: {
+            eat_cycles(is_acc_16() ? 5 : 4);
+            uint32_t addr = addr_from_absolute(eat_u16());
+            uint16_t value = is_acc_16() ? read_u16(addr) : read_mem(addr);
+            uint16_t a = registers.A & (is_acc_16() ? 0xFFFF : 0xFF);
+            uint16_t out = a - value;
+
+            registers.status.flags.N = auto_negative(out);
+            registers.status.flags.Z = a == value;
+            registers.status.flags.C = a >= value;
+
+            break;
+       } case 0xE2: {
+            eat_cycles(3);
+            registers.status.byte |= eat_u8();
+            if (registers.status.flags.X) {
+                set_high_byte(&registers.X, 0x00);
+                set_high_byte(&registers.Y, 0x00);
+            }
+            break;
+       } case 0xE9: { // SBC #const
+            eat_cycles(is_acc_16() ? 3 : 2);
+            uint16_t val = is_acc_16() ? eat_u16() : (0 | eat_u8());
+
+            if (registers.status.flags.D && !is_acc_16()) {
+                // ...
+                ASSERT_NOT_REACHED("Decimal subtraction not implemented");
+            } else {
+                uint16_t max_mask = is_acc_16() ? 0xFFFF : 0xFF;
+                uint16_t old_a = registers.A;
+
+                uint32_t unclamped = registers.A + (~val) + registers.status.flags.C;
+                registers.A = unclamped & max_mask;
+                
+                registers.status.flags.C = unclamped > (uint32_t)max_mask;
+
+                // Totally stole this. Basically determines if for C = A - B, where sign(A) != sign(B), sign(C) == sign(B)
+                registers.status.flags.V = !!(((old_a ^ val) & (old_a ^ registers.A)) & (is_acc_16() ? 0x8000 : 0x80));
+            }
+
+            registers.status.flags.N = auto_negative(registers.A);
+            registers.status.flags.Z = auto_zero(registers.A);
+
+            break;
+       } case 0xA8: {
+            eat_cycles(2);
+            if (registers.status.flags.X) {
+                set_low_byte(&registers.Y, registers.A);
+                registers.status.flags.N = !!(registers.A & (0b1 << 7));
+                registers.status.flags.Z = !(registers.A & 0xFF);
+            } else {
+                registers.Y = registers.A;
+                registers.status.flags.N = !!(registers.A & (0b1 << 15));
+                registers.status.flags.Z = registers.A == 0;
+            }
             break;
        } case 0x5B: {
             eat_cycles(2);
@@ -232,9 +355,21 @@ void execute_opcode(uint8_t opcode) {
             registers.status.flags.N = registers.A >> 15;
             registers.status.flags.Z = registers.A == 0;
             break;
+       } case 0xCA: {
+            if (is_index_16()) {
+                registers.X--;
+                registers.status.flags.Z = !registers.X;
+                registers.status.flags.N = !!(registers.X >> 15);
+            } else {
+                uint8_t val = (registers.X & 0xFF) - 1;
+                set_low_byte(&registers.X, val);
+                registers.status.flags.Z = !val;
+                registers.status.flags.N = !!(val >> 7);
+            }
+            break;
        } case 0x8D: {
             eat_cycles(is_acc_16() ? 5 : 4);
-            uint32_t loc = (registers.DBR << 16) | eat_u16();
+            uint32_t loc = addr_from_absolute(eat_u16());
             write_u16(loc, registers.A & (is_acc_16() ? 0xFFFF : 0xFF));
             break;
        } case 0x8F: {
@@ -242,19 +377,48 @@ void execute_opcode(uint8_t opcode) {
             uint32_t loc = eat_u24();
             write_u16(loc, registers.A & (is_acc_16() ? 0xFFFF : 0xFF));
             break;
+       } case 0x98: {
+            eat_cycles(2);
+            if (is_acc_16()) {
+                registers.A = registers.Y;
+            } else {
+                registers.A = (registers.A & 0xFF00) | (registers.Y & 0xFF);
+            }
+            registers.status.flags.N = auto_negative(registers.A);
+            registers.status.flags.Z = auto_zero(registers.A);
+            break;
        } case 0x9C: { // STZ addr
             eat_cycles(is_acc_16() ? 5 : 4);
-            uint32_t loc = (registers.DBR << 16) | eat_u16();
+            uint32_t loc = addr_from_absolute(eat_u16());
             if (is_acc_16()) {
                 write_u16(loc, 0x0000);
             } else {
                 write_u8(loc, 0x00);
             }
             break;
+       } case 0x9F: {
+            eat_cycles(is_acc_16() ? 6 : 5);
+            uint32_t loc = eat_u24() + registers.X;
+            if (is_acc_16()) {
+                write_u16(loc, registers.X);
+            } else {
+                write_u8(loc, registers.X & 0xFF);
+            }
+            break;
+       } case 0xA0: {
+            eat_cycles(is_acc_16() ? 3 : 2);
+            uint16_t value = is_acc_16() ? eat_u16() : eat_u8();
+            set_register(&registers.Y, value);
+            break;
+       } case 0xA2: {
+            eat_cycles(is_acc_16() ? 3 : 2);
+            uint16_t value = is_acc_16() ? eat_u16() : eat_u8();
+            set_register(&registers.X, value);
+            break;
        } case 0xA9: {
             eat_cycles(is_acc_16() ? 3 : 2);
             uint16_t value = is_acc_16() ? eat_u16() : eat_u8();
-            set_accumulator(value);
+            set_register(&registers.A, value);
             break;
        } case 0xC2: {
             eat_cycles(3);
@@ -286,12 +450,12 @@ void execute_opcode(uint8_t opcode) {
 }
 
 void run() {
-    uint16_t reset_vector = read_u16((uint8_t*)(rom_file.data + rom_file.header_offset + 0x3C));
+    uint16_t reset_vector = read_u16_raw((uint8_t*)(rom_file.data + rom_file.header_offset + 0x3C));
     registers.PC = 0x000000 | (uint32_t)reset_vector;
     printf("PC: %x\n", registers.PC);
 
     while (true) {
-        printf("[x] ::");
+        printf("[x::%x] ::", registers.PC);
         uint8_t opcode = eat_u8();
         execute_opcode(opcode);
         printf("\n");
