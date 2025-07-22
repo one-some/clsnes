@@ -16,6 +16,20 @@ struct RomFile {
 
 struct Registers {
     uint32_t PC;
+
+    union {
+        struct {
+            uint8_t C : 1; // Carry
+            uint8_t Z : 1; // Zero
+            uint8_t I : 1; // IRQ Disable
+            uint8_t D : 1; // Decimal Mode
+            uint8_t X : 1; // Index Register Select
+            uint8_t M : 1; // Accumulator Select
+            uint8_t V : 1; // Overflow
+            uint8_t N : 1; // Negative
+        } flags;
+        uint8_t byte;
+    } status;
 } registers;
 
 void load_rom(const char* path) {
@@ -63,8 +77,8 @@ int get_heuristic_score_for_header_candidate(size_t offset) {
     } else if (map_mode == 0b11) {
         ASSERT_NOT_REACHED("Unimplemented: ExHiROM");
     } else {
+        printf("[%lx] Weird map mode\n", offset);
         score -= 100;
-        //ASSERT_NOT_REACHED("Unknown map_mode %d", map_mode);
     }
 
     uint16_t reset_vector = read_u16((uint8_t*)(rom_file.data + offset + 0x3C));
@@ -82,10 +96,11 @@ int get_heuristic_score_for_header_candidate(size_t offset) {
 
 void locate_header() {
     size_t winning_offset = LO_ROM_OFFSET;
-    size_t winning_score = get_heuristic_score_for_header_candidate(LO_ROM_OFFSET);
+    int winning_score = get_heuristic_score_for_header_candidate(LO_ROM_OFFSET);
 
-    size_t other_score = get_heuristic_score_for_header_candidate(HI_ROM_OFFSET);
+    int other_score = get_heuristic_score_for_header_candidate(HI_ROM_OFFSET);
     if (other_score > winning_score) {
+        printf("%d > %d\n", other_score, winning_score);
         winning_offset = HI_ROM_OFFSET;
         winning_score = other_score;
     }
@@ -100,27 +115,20 @@ void locate_header() {
     printf("Hello '%s'\n", game_name);
 }
 
-void execute_opcode(uint8_t opcode) {
-    switch (opcode) {
-        default:
-            ASSERT_NOT_REACHED("Undefined opcode: 0x%x", opcode);
-            break;
-    }
-}
-
 uint8_t read_mem(uint32_t address) {
     uint8_t bank = address >> 16;
     uint16_t offset = address & 0xFFFF;
 
     if (rom_file.header_offset == LO_ROM_OFFSET) {
+        printf("LOROM\n");
         if (offset >= 0x8000) {
             // LoROM
             uint32_t rom_read = offset - 0x8000 + (bank * 0x8000);
             return *(rom_file.data + rom_read);
         }
-
     } else if (rom_file.header_offset == HI_ROM_OFFSET) {
         // HiROM
+        printf("HIROM\n");
 
     } else {
         ASSERT_NOT_REACHED("Bad header offset");
@@ -129,13 +137,47 @@ uint8_t read_mem(uint32_t address) {
     ASSERT_NOT_REACHED("Unsure how to read %x", address);
 }
 
+void write_u8(uint32_t addr, uint8_t byte) {
+    printf("Write %x to %x\n", byte, addr);
+}
+
+uint8_t eat_u8() {
+    return read_mem(registers.PC++);
+}
+
+uint16_t eat_u16() {
+    uint8_t a = eat_u8();
+    uint8_t b = eat_u8();
+
+    return (b << 8) | a;
+}
+
+void eat_cycles(int count) {
+}
+
+void execute_opcode(uint8_t opcode) {
+    switch (opcode) {
+        case 0x78: // SEI
+            eat_cycles(2);
+            registers.status.flags.I = 1;
+            break;
+        case 0x9C: // STZ addr
+            uint32_t loc = (registers.PC & 0xFF0000) | eat_u16();
+            write_u8(loc, 0x00);
+            break;
+        default:
+            ASSERT_NOT_REACHED("Undefined opcode: 0x%x", opcode);
+            break;
+    }
+}
+
 void run() {
     uint16_t reset_vector = read_u16((uint8_t*)(rom_file.data + rom_file.header_offset + 0x3C));
     registers.PC = 0x000000 | (uint32_t)reset_vector;
     printf("PC: %x\n", registers.PC);
 
     while (true) {
-        uint8_t opcode = read_mem(registers.PC++);
+        uint8_t opcode = eat_u8();
         execute_opcode(opcode);
     }
 }
