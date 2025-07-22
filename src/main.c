@@ -16,6 +16,14 @@ struct RomFile {
 
 struct Registers {
     uint32_t PC;
+    uint16_t S;
+    uint16_t A;
+    uint16_t X;
+    uint16_t Y;
+    uint16_t D;
+
+    uint8_t E_flag;
+    uint8_t DBR;
 
     union {
         struct {
@@ -30,6 +38,7 @@ struct Registers {
         } flags;
         uint8_t byte;
     } status;
+
 } registers;
 
 void load_rom(const char* path) {
@@ -120,7 +129,6 @@ uint8_t read_mem(uint32_t address) {
     uint16_t offset = address & 0xFFFF;
 
     if (rom_file.header_offset == LO_ROM_OFFSET) {
-        printf("LOROM\n");
         if (offset >= 0x8000) {
             // LoROM
             uint32_t rom_read = offset - 0x8000 + (bank * 0x8000);
@@ -137,35 +145,141 @@ uint8_t read_mem(uint32_t address) {
     ASSERT_NOT_REACHED("Unsure how to read %x", address);
 }
 
-void write_u8(uint32_t addr, uint8_t byte) {
-    printf("Write %x to %x\n", byte, addr);
+void write_u8(uint32_t loc, uint8_t value) {
+    // printf("Write %x to %x\n", loc, value);
+}
+
+void write_u16(uint32_t loc, uint16_t value) {
+    write_u8(loc, value >> 8);
+    write_u8(loc + 1, value & 0xFF);
 }
 
 uint8_t eat_u8() {
-    return read_mem(registers.PC++);
+    uint8_t out = read_mem(registers.PC++);
+    printf(" %x", out);
+    return out;
 }
 
 uint16_t eat_u16() {
+    uint8_t a = read_mem(registers.PC++);
+    uint8_t b = read_mem(registers.PC++);
+
+    uint16_t out = (b << 8) | a;
+    printf(" %x", out);
+    return out;
+}
+
+uint32_t eat_u24() {
     uint8_t a = eat_u8();
     uint8_t b = eat_u8();
+    uint8_t c = eat_u8();
 
-    return (b << 8) | a;
+    return 0x000000 | (c << 16) | (b << 8) | a;
+}
+
+bool is_acc_16() {
+    return (!registers.status.flags.M) && (!registers.E_flag);
 }
 
 void eat_cycles(int count) {
+    // ...
+}
+
+void set_accumulator(uint16_t value) {
+    if (is_acc_16()) {
+        registers.A = value;
+        registers.status.flags.N = !!(registers.A & 0b1000000000000000);
+        registers.status.flags.Z = value == 0;
+    } else {
+        uint8_t val_8 = value & 0xFF;
+        registers.A = (registers.A & 0xFF00) | val_8;
+        registers.status.flags.N = !!(val_8 & 0b10000000);
+        registers.status.flags.Z = val_8 == 0;
+    }
 }
 
 void execute_opcode(uint8_t opcode) {
     switch (opcode) {
-        case 0x78: // SEI
+        case 0x18: {
+            eat_cycles(2);
+            registers.status.flags.C = 0;
+            break;
+       } case 0x58: {
+            eat_cycles(2);
+            registers.status.flags.I = 0;
+            break;
+       } case 0xB8: {
+            eat_cycles(2);
+            registers.status.flags.V = 0;
+            break;
+       } case 0xD8: {
+            eat_cycles(2);
+            registers.status.flags.D = 0;
+            break;
+       } case 0x78: { // SEI
             eat_cycles(2);
             registers.status.flags.I = 1;
             break;
-        case 0x9C: // STZ addr
-            uint32_t loc = (registers.PC & 0xFF0000) | eat_u16();
-            write_u8(loc, 0x00);
+       } case 0x5B: {
+            eat_cycles(2);
+            registers.D = registers.A;
+            registers.status.flags.N = registers.A >> 15;
+            registers.status.flags.Z = registers.A == 0;
             break;
-        default:
+       } case 0x1B: {
+            eat_cycles(2);
+            registers.S = registers.A;
+            registers.status.flags.N = registers.A >> 15;
+            registers.status.flags.Z = registers.A == 0;
+            break;
+       } case 0x8D: {
+            eat_cycles(is_acc_16() ? 5 : 4);
+            uint32_t loc = (registers.DBR << 16) | eat_u16();
+            write_u16(loc, registers.A & (is_acc_16() ? 0xFFFF : 0xFF));
+            break;
+       } case 0x8F: {
+            eat_cycles(is_acc_16() ? 6 : 5);
+            uint32_t loc = eat_u24();
+            write_u16(loc, registers.A & (is_acc_16() ? 0xFFFF : 0xFF));
+            break;
+       } case 0x9C: { // STZ addr
+            eat_cycles(is_acc_16() ? 5 : 4);
+            uint32_t loc = (registers.DBR << 16) | eat_u16();
+            if (is_acc_16()) {
+                write_u16(loc, 0x0000);
+            } else {
+                write_u8(loc, 0x00);
+            }
+            break;
+       } case 0xA9: {
+            eat_cycles(is_acc_16() ? 3 : 2);
+            uint16_t value = is_acc_16() ? eat_u16() : eat_u8();
+            set_accumulator(value);
+            break;
+       } case 0xC2: {
+            eat_cycles(3);
+            registers.status.byte = registers.status.byte & (~eat_u8());
+            if (registers.E_flag) {
+                registers.status.flags.X = 1;
+                registers.status.flags.M = 1;
+            }
+            break;
+       } case 0xFB: {
+            eat_cycles(2);
+            uint8_t old_e = registers.E_flag;
+            registers.E_flag = registers.status.flags.C;
+            registers.status.flags.C = old_e;
+
+            if (registers.E_flag) {
+                registers.status.flags.M = 1;
+                registers.status.flags.X = 1;
+                registers.S = 0x0100 | (registers.S & 0xFF);
+                registers.X = 0x0000 | (registers.X & 0xFF);
+                registers.Y = 0x0000 | (registers.Y & 0xFF);
+            }
+            break;
+        break;
+       } default:
             ASSERT_NOT_REACHED("Undefined opcode: 0x%x", opcode);
             break;
     }
@@ -177,13 +291,25 @@ void run() {
     printf("PC: %x\n", registers.PC);
 
     while (true) {
+        printf("[x] ::");
         uint8_t opcode = eat_u8();
         execute_opcode(opcode);
+        printf("\n");
     }
+}
+
+void setup_cpu() {
+    registers.DBR = 0x00;
+    registers.status.flags.M = 1;
+    registers.status.flags.X = 1;
+    registers.status.flags.D = 0;
+    registers.status.flags.I = 1;
+    registers.E_flag = 1;
 }
 
 int main() {
     printf("Hello world\n");
+    setup_cpu();
     load_rom("mairo.smc");
     locate_header();
     run();
