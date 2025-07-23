@@ -83,10 +83,10 @@ struct Memory {
         uint8_t byte;
     } MDMAEN_HBLANK_DMA;
 
-    uint8_t APUI00;
-    uint8_t APUI01;
-    uint8_t APUI02;
-    uint8_t APUI03;
+    uint8_t APUIO0;
+    uint8_t APUIO1;
+    uint8_t APUIO2;
+    uint8_t APUIO3;
 
     union {
         struct {
@@ -106,6 +106,10 @@ struct Memory {
         uint8_t byte;
     } OBSEL;
 } memory;
+
+void breakpoint() {
+    getchar();
+}
 
 void load_rom(const char* path) {
     FILE* fp = fopen(path, "rb");
@@ -204,12 +208,21 @@ void handle_io_write(uint16_t addr, uint8_t value) {
         case 0x2100: memory.INIDISP.byte = value; break;
         case 0x2101: memory.OBSEL.byte = value; break;
         case 0x2140:
-             memory.APUI00 = value;
-             printf("WROTE %x\n", value);
+             memory.APUIO0 = value;
+             printf("[0] WROTE %x\n", value);
              break;
-        case 0x2141: memory.APUI01 = value; break;
-        case 0x2142: memory.APUI02 = value; break;
-        case 0x2143: memory.APUI03 = value; break;
+        case 0x2141:
+             memory.APUIO1 = value;
+             printf("[1] WROTE %x\n", value);
+             break;
+        case 0x2142:
+             memory.APUIO2 = value;
+             printf("[2] WROTE %x\n", value);
+             break;
+        case 0x2143:
+             memory.APUIO3 = value;
+             printf("[3] WROTE %x\n", value);
+             break;
         case 0x4200: memory.NMITIMEN.byte = value; break;
         case 0x420B: memory.MDMAEN_GENERAL_PURPOSE.byte = value; break;
         case 0x420C: memory.MDMAEN_HBLANK_DMA.byte = value; break;
@@ -221,18 +234,18 @@ void handle_io_write(uint16_t addr, uint8_t value) {
 uint8_t handle_io_read(uint16_t addr) {
     if (is_acc_16()) {
         switch (addr) {
-            case 0x2140: return (memory.APUI01 << 8) | memory.APUI00;
-            case 0x2141: return (memory.APUI02 << 8) | memory.APUI01;
+            case 0x2140: return (memory.APUIO1 << 8) | memory.APUIO0;
+            case 0x2141: return (memory.APUIO2 << 8) | memory.APUIO1;
             default:
                 ASSERT_NOT_REACHED("[ACC16] Unsure how to handle read from I/O register %x)", addr);
         }
     }
 
     switch (addr) {
-        case 0x2140: return memory.APUI00;
-        case 0x2141: return memory.APUI01;
-        case 0x2142: return memory.APUI02;
-        case 0x2143: return memory.APUI03;
+        case 0x2140: return memory.APUIO0;
+        case 0x2141: return memory.APUIO1;
+        case 0x2142: return memory.APUIO2;
+        case 0x2143: return memory.APUIO3;
         default:
             ASSERT_NOT_REACHED("Unsure how to handle read from I/O register %x)", addr);
     }
@@ -367,11 +380,74 @@ bool auto_zero(uint16_t value) {
     return value == 0;
 }
 
+void push_u8_to_stack(uint8_t value) {
+    write_u8(registers.S--, value);
+}
+
+void push_u16_to_stack(uint16_t value) {
+    write_u8(registers.S--, value >> 8);
+    write_u8(registers.S--, value & 0xFF);
+}
+
+void increment(uint16_t* reg, int32_t sign) {
+    eat_cycles(2);
+    if (is_index_16()) {
+        (*reg) = *reg+ sign;
+        registers.status.flags.Z = !(*reg);
+        registers.status.flags.N = !!(*reg>> 15);
+    } else {
+        uint8_t val = (*reg& 0xFF) + sign;
+        set_low_byte(reg, val);
+        registers.status.flags.Z = !val;
+        registers.status.flags.N = !!(val >> 7);
+    }
+}
+
 void execute_opcode(uint8_t opcode) {
     switch (opcode) {
        case 0x08: {
             eat_cycles(3);
-            write_u8(--registers.S, registers.status.byte);
+            push_u8_to_stack(registers.status.byte);
+            break;
+       } case 0x48: {
+            eat_cycles(3);
+            if (is_acc_16()) {
+                eat_cycles(1);
+                push_u16_to_stack(registers.A);
+            } else {
+                push_u8_to_stack(registers.A);
+            }
+            break;
+       } case 0x8B: {
+            eat_cycles(3);
+            push_u8_to_stack(registers.DBR);
+            break;
+       } case 0x0B: {
+            eat_cycles(4);
+            push_u8_to_stack(registers.D);
+            break;
+       } case 0x4B: {
+            eat_cycles(3);
+            // PBR
+            push_u8_to_stack(read_mem(0x3034));
+            break;
+       } case 0xDA: {
+            eat_cycles(3);
+            if (is_index_16()) {
+                eat_cycles(1);
+                push_u16_to_stack(registers.X);
+            } else {
+                push_u8_to_stack(registers.X);
+            }
+            break;
+       } case 0x5A: {
+            eat_cycles(3);
+            if (is_index_16()) {
+                eat_cycles(1);
+                push_u16_to_stack(registers.Y);
+            } else {
+                push_u8_to_stack(registers.Y);
+            }
             break;
        } case 0x10: {
             bool take_branch = !registers.status.flags.N;
@@ -397,13 +473,18 @@ void execute_opcode(uint8_t opcode) {
                 registers.PC += relative;
             }
             break;
+       } case 0x80: {
+            // TODO: Make brnaching generic
+            eat_cycles(registers.E_flag ? 4 : 3);
+            int8_t relative = (int8_t)eat_u8();
+            registers.PC += relative;
+            break;
        } case 0x20: {
             eat_cycles(6);
             uint32_t loc = addr_from_absolute(eat_u16());
             uint16_t return_addr = registers.PC - 1;
 
-            write_u8(registers.S--, return_addr >> 8);
-            write_u8(registers.S--, return_addr & 0xFF);
+            push_u16_to_stack(return_addr);
 
             registers.PC = loc;
             break;
@@ -480,6 +561,18 @@ void execute_opcode(uint8_t opcode) {
             registers.status.flags.Z = auto_zero(registers.A);
 
             break;
+       } case 0xAA: {
+            eat_cycles(2);
+            if (registers.status.flags.X) {
+                set_low_byte(&registers.X, registers.A);
+                registers.status.flags.N = !!(registers.A & (0b1 << 7));
+                registers.status.flags.Z = !(registers.A & 0xFF);
+            } else {
+                registers.X = registers.A;
+                registers.status.flags.N = !!(registers.A & (0b1 << 15));
+                registers.status.flags.Z = registers.A == 0;
+            }
+            break;
        } case 0xA8: {
             eat_cycles(2);
             if (registers.status.flags.X) {
@@ -505,16 +598,16 @@ void execute_opcode(uint8_t opcode) {
             registers.status.flags.Z = registers.A == 0;
             break;
        } case 0xCA: {
-            if (is_index_16()) {
-                registers.X--;
-                registers.status.flags.Z = !registers.X;
-                registers.status.flags.N = !!(registers.X >> 15);
-            } else {
-                uint8_t val = (registers.X & 0xFF) - 1;
-                set_low_byte(&registers.X, val);
-                registers.status.flags.Z = !val;
-                registers.status.flags.N = !!(val >> 7);
-            }
+           increment(&registers.X, -1);
+            break;
+       } case 0x88: {
+           increment(&registers.Y, -1);
+            break;
+       } case 0xE8: {
+           increment(&registers.X, 1);
+            break;
+       } case 0xC8: {
+           increment(&registers.Y, 1);
             break;
        } case 0x8D: {
             eat_cycles(is_acc_16() ? 5 : 4);
@@ -569,6 +662,15 @@ void execute_opcode(uint8_t opcode) {
             uint16_t value = is_acc_16() ? eat_u16() : eat_u8();
             set_register(&registers.A, value);
             break;
+       } case 0xB7: {
+            eat_cycles(is_acc_16() ? 7 : 6);
+            uint32_t loc = addr_from_absolute(eat_u8());
+            uint16_t y = is_acc_16() ? registers.Y : (registers.Y & 0xFF);
+            loc += y;
+
+            uint16_t value = is_acc_16() ? read_u16(loc) : read_mem(loc);
+            set_register(&registers.A, value);
+            break;
        } case 0xC2: {
             eat_cycles(3);
             registers.status.byte = registers.status.byte & (~eat_u8());
@@ -602,9 +704,18 @@ void run() {
     uint16_t reset_vector = read_u16_raw((uint8_t*)(rom_file.data + rom_file.header_offset + 0x3C));
     registers.PC = 0x000000 | (uint32_t)reset_vector;
     printf("PC: %x\n", registers.PC);
+    size_t op_count = 0;
 
     while (true) {
+        op_count++;
         printf("[x::%x] ::", registers.PC);
+        
+        // TOTAL HACK FOR SMW
+        if (op_count == 10) {
+            memory.APUIO0 = 0xAA;
+            memory.APUIO1 = 0xBB;
+        }
+
         uint8_t opcode = eat_u8();
         execute_opcode(opcode);
         printf("\n");
@@ -618,10 +729,6 @@ void setup_cpu() {
     registers.status.flags.D = 0;
     registers.status.flags.I = 1;
     registers.E_flag = 1;
-
-    // Setup APU (mostly HAX)
-    memory.APUI00 = 0xAA;
-    memory.APUI01 = 0xBB;
 }
 
 int main() {
